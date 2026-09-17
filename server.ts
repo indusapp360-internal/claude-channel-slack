@@ -183,6 +183,60 @@ function saveAccess(a: Access): void {
   renameSync(tmp, ACCESS_FILE)
 }
 
+// ── Env-seeded access policy ─────────────────────────────────────────────────
+// For unattended, single-purpose instances (one bot, one channel, one operator)
+// the whole policy can come from the process environment so no interactive
+// /slack-channel:access step is needed and the instance is locked down from
+// its first start:
+//
+//   SLACK_CHANNEL_ID        = C…            the only channel this bot serves
+//   SLACK_ALLOWED_USER_IDS  = U…[,U…]       humans allowed to drive the session
+//   SLACK_REQUIRE_MENTION   = 1 (default) | 0
+//   SLACK_DM_POLICY         = disabled (default) | allowlist | pairing
+//
+// When both SLACK_CHANNEL_ID and SLACK_ALLOWED_USER_IDS are set, access.json is
+// rewritten at boot: the listed users become the channel's `allowFrom` AND the
+// top-level `allowFrom` (the latter is who receives permission-relay DMs), and
+// every other channel is dropped. Runtime mutations via the access skill are
+// overwritten on the next start — the environment is the source of truth.
+function seedAccessFromEnv(): void {
+  const channelId = (process.env.SLACK_CHANNEL_ID ?? '').trim()
+  const userIds = (process.env.SLACK_ALLOWED_USER_IDS ?? '')
+    .split(',').map(s => s.trim()).filter(Boolean)
+  if (!channelId && userIds.length === 0) return
+  if (!channelId || userIds.length === 0) {
+    process.stderr.write(
+      `slack channel: SLACK_CHANNEL_ID and SLACK_ALLOWED_USER_IDS must be set together\n`,
+    )
+    process.exit(1)
+  }
+  if (!/^[CG][A-Z0-9]+$/.test(channelId) || userIds.some(u => !/^[UW][A-Z0-9]+$/.test(u))) {
+    process.stderr.write(`slack channel: SLACK_CHANNEL_ID / SLACK_ALLOWED_USER_IDS malformed\n`)
+    process.exit(1)
+  }
+  const requireMention = (process.env.SLACK_REQUIRE_MENTION ?? '1') !== '0'
+  const dmPolicyRaw = process.env.SLACK_DM_POLICY ?? 'disabled'
+  if (dmPolicyRaw !== 'disabled' && dmPolicyRaw !== 'allowlist' && dmPolicyRaw !== 'pairing') {
+    process.stderr.write(`slack channel: SLACK_DM_POLICY must be disabled|allowlist|pairing\n`)
+    process.exit(1)
+  }
+  const existing = loadAccess()
+  const seeded: Access = {
+    ...existing,
+    dmPolicy: dmPolicyRaw,
+    allowFrom: userIds,
+    channels: { [channelId]: { requireMention, allowFrom: userIds, allowBots: [] } },
+    pending: {},
+  }
+  saveAccess(seeded)
+  process.stderr.write(
+    `slack channel: access policy seeded from env — channel ${channelId}, ` +
+    `${userIds.length} allowed user(s), requireMention=${requireMention}, dmPolicy=${dmPolicyRaw}\n`,
+  )
+}
+
+seedAccessFromEnv()
+
 function pruneExpired(a: Access): boolean {
   const now = Date.now()
   let changed = false
@@ -262,9 +316,9 @@ const mcp = new Server(
       '',
       '## Per-thread dispatch (IMPORTANT)',
       '',
-      'Every inbound <channel source="slack"> event should be dispatched to a dedicated subagent scoped to the Slack thread_ts, so unrelated conversations stay isolated. Invoke the /slack-channel:threads skill to handle this dispatch — it maintains a persistent thread_ts → agent_id mapping in ~/.claude/channels/slack/threads.json and uses the Agent tool to spawn new thread subagents or SendMessage to resume existing ones.',
+      'Every inbound <channel source="slack"> event should be dispatched to a dedicated subagent scoped to the Slack thread_ts, so unrelated conversations stay isolated. Invoke the /slack-channel:threads skill to handle this dispatch — it maintains a persistent thread_ts → agent_id mapping in ' + join(STATE_DIR, 'threads.json') + ' and uses the Agent tool to spawn new thread subagents or SendMessage to resume existing ones.',
       '',
-      'The threads skill also handles channel-to-repo routing via ~/.claude/channels/slack/routes.json. Different Slack channels can be mapped to different repo paths — the dispatcher spawns each subagent with its channel\'s target project context, so one bot can serve many repos.',
+      'The threads skill also handles channel-to-repo routing via ' + join(STATE_DIR, 'routes.json') + '. Different Slack channels can be mapped to different repo paths — the dispatcher spawns each subagent with its channel\'s target project context, so one bot can serve many repos.',
       '',
       'Do NOT reply to Slack directly from the main session. The dispatched subagent calls the reply tool. Your role on the main session is: read the inbound event, invoke /slack-channel:threads, done.',
       '',
@@ -852,7 +906,12 @@ slackApp.event('message', async ({ event }) => {
   }
 
   if (isStickyThread) {
-    const access = loadAccess()
+    // Sticky is a mention-exemption, not an access-exemption. The sender must
+    // still pass the channel policy (allowFrom / allowBots), otherwise anyone
+    // in the workspace who replies into an engaged thread reaches the session.
+    const sticky = await gate(senderId, channelId, 'channel', true, isBot, botSenderUserId)
+    if (sticky.action !== 'deliver') return
+    const access = sticky.access
     const ackReaction = access.ackReaction ?? 'eyes'
     if (ackReaction) {
       try {
