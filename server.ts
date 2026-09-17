@@ -887,7 +887,12 @@ slackApp.event('message', async ({ event }) => {
   const threadTs = msg.thread_ts
 
   const isDM = channelType === 'im'
-  const isMention = !isDM
+  // A channel message is a mention only if it actually addresses this bot.
+  // Upstream treated every channel message as a mention, which made
+  // `requireMention` a no-op and, with several bots sharing a channel, had all
+  // of them answer every message. Thread follow-ups without a re-@mention are
+  // handled by the sticky-thread path below, not here.
+  const isMention = !isDM && !!botUserId && typeof msg.text === 'string' && msg.text.includes(`<@${botUserId}>`)
 
   // Sticky thread: if this is a reply in a channel thread that already has a
   // tracked subagent, treat it as engaged. Standard Slack bot UX — once the
